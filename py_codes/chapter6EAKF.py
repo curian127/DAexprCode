@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+6. 串行EAKF方法用于L96模式
+@author: shenzheqi
+"""
+#%% 5-1 L96模式的积分算子和观测算子
+import numpy as np
+def Lorenz96(state,*args):                      # 定义Lorenz 96 模式右端项
+    x = state                                # 模式状态记为x
+    F = args[0]                              # 输入外强迫
+    n = len(x)                               # 状态空间维数
+    f = np.zeros(n)                          
+    f[0] = (x[1] - x[n-2]) * x[n-1] - x[0]      # 处理三个边界点: i=0,1,N-1
+    f[1] = (x[2] - x[n-1]) * x[0] - x[1]        # 导入周期边界条件
+    f[n-1] = (x[0] - x[n-3]) * x[n-2] - x[n-1]
+    for i in range(2, n-1):                  
+        f[i] = (x[i+1] - x[i-2]) * x[i-1] - x[i]   # 内部点符合方程（9）
+    f = f + F                            # 加上外强迫
+    return f
+
+def RK4(rhs,state,dt,*args):                    # 使用Runge-Kutta方法求解（同L63）
+    k1 = rhs(state,*args)
+    k2 = rhs(state+k1*dt/2,*args)
+    k3 = rhs(state+k2*dt/2,*args)
+    k4 = rhs(state+k3*dt,*args)
+    new_state = state + (dt/6)*(k1+2*k2+2*k3+k4)
+    return new_state
+
+def h(x):                                         # 观测算子(假设只观测部分变量)
+    n= x.shape[0]                                # 状态维数
+    m= 9                                       # 总观测数
+    H = np.zeros((m,n))                           # 设定观测算子
+    di = int(n/m)                                 # 两个观测之间的空间距离
+    for i in range(m):
+        H[i,(i+1)*di-1] = 1                        # 通过设置观测位置给出观测矩阵
+    z = H @ x                                   # 左乘观测矩阵得到观测算子
+    return z
+# 以下求出的线性化观测算子实际上就是输出观测矩阵。
+def Dh(x):
+    n= x.shape[0]
+    m= 9
+    H = np.zeros((m,n))    
+    di = int(n/m) 
+    for i in range(m):
+        H[i,(i+1)*di-1] = 1
+    return H
+#%% 5-2 Lorenz 96模式的真值积分和观测模拟
+n = 36                  # 状态空间维数
+F = 8                   # 外强迫项
+dt = 0.01               # 积分步长
+# 1. spinup获取真实场初值: 从 t=-20 积分到 t = 0 以获取实验初值
+x0 = F * np.ones(n)     # 初值
+x0[19] = x0[19] + 0.01  # 在第20个变量上增加微小扰动
+x0True = x0
+nt1 = int(20/dt)
+for k in range(nt1):
+    x0True = RK4(Lorenz96,x0True,dt,F)   #从t=-20积分到t=0
+# 2. 真值实验和观测的信息
+tm = 20                   # 实验窗口长度
+nt = int(tm/dt)             # 积分步数
+t = np.linspace(0,tm,nt+1)
+np.random.seed(seed=1)
+m = 9                   # 观测变量数
+dt_m = 0.2               # 两次观测之间的时间
+tm_m = 20               # 最大观测时间
+nt_m = int(tm_m/dt_m)    # 同化次数
+ind_m = (np.linspace(int(dt_m/dt),int(tm_m/dt),nt_m)).astype(int)
+t_m = t[ind_m]
+
+sig_m= 0.1              # 观测误差标准差
+R = sig_m**2*np.eye(m)   # 观测误差协方差
+# 3. 造真值和观测
+xTrue = np.zeros([n,nt+1])
+xTrue[:,0] = x0True
+km = 0
+yo = np.zeros([m,nt_m])
+for k in range(nt):
+    xTrue[:,k+1] = RK4(Lorenz96,xTrue[:,k],dt,F)    # 真值
+    if (km<nt_m) and (k+1==ind_m[km]):
+        yo[:,km] = h(xTrue[:,k+1]) + np.random.normal(0,sig_m,[m,])  # 加噪声得到观测
+        km = km+1
+#%% 5-3 Gaspri-Cohn有理函数的代码和局地化矩阵
+def comp_cov_factor(z_in,c):
+    z=abs(z_in);             # 输入距离和局地化参数，输出局地化因子的数值
+    if z<=c:                # 分段函数的各个条件
+        r = z/c;
+        cov_factor=((( -0.25*r +0.5)*r +0.625)*r -5.0/3.0)*r**2 + 1.0;
+    elif z>=c*2.0:
+        cov_factor=0.0;
+    else:
+        r = z / c;
+        cov_factor = ((((r/12.0 -0.5)*r +0.625)*r +5.0/3.0)*r -5.0)*r + 4.0 - 2.0 / (3.0 * r);
+    return cov_factor
+
+def Rho(localP,size):
+    from scipy.linalg import toeplitz
+    rho0 = np.zeros(size)
+    for j in range(size):
+        rho0[j]=comp_cov_factor(j,localP)
+    Loc = toeplitz(rho0,rho0) 
+    return Loc
+#%% 6-6 串行集合调整卡尔曼滤波器（EAKF）
+def obs_increment_eakf(ensemble, observation, obs_error_var): # 1：计算观测空间增量
+    prior_mean = np.mean(ensemble);
+    prior_var = np.var(ensemble);
+    if prior_var >1e-6:         # 用于避免退化的先验集合造成错误更新
+        post_var = 1.0 / (1.0 / prior_var + 1.0 / obs_error_var);       # 公式（2）
+        post_mean = post_var * (prior_mean / prior_var + observation / obs_error_var);  # 公式（3）
+    else:
+        post_var = prior_var; post_mean = prior_mean;    
+    updated_ensemble = ensemble - prior_mean + post_mean;
+    var_ratio = post_var / prior_var;
+    updated_ensemble = np.sqrt(var_ratio) * (updated_ensemble - post_mean) + post_mean; # 公式（4）
+    obs_increments = updated_ensemble - ensemble;
+    return obs_increments
+def get_state_increments(state_ens, obs_ens, obs_incs): # 2将观测增量回归到状态增量
+    covar = np.cov(state_ens, obs_ens);
+    state_incs = obs_incs * covar[0,1]/covar[1,1];
+    return state_incs
+
+def sEAKF(xai,yo,ObsOp, R, RhoM):
+    n,N = xai.shape;                  # 状态维数
+    m = yo.shape[0];                  # 观测数
+    Loc = ObsOp(RhoM)               # 观测空间局地化
+    for i in range(m):                  # 针对每个标量观测的循环
+        hx = ObsOp(xai);              # 投影到观测空间 
+        hxi = hx[i];                    # 投影到对应的矢量观测，公式（6-3-1）
+        obs_inc = obs_increment_eakf(hxi,yo[i],R[i,i]);
+        for j in range(n):                # 针对状态变量的每个元素的循环
+            state_inc = get_state_increments(xai[j], hxi,obs_inc)   # 获取状态增量
+            cov_factor=Loc[i,j]          # 使用局地化矩阵的相应元素
+            if cov_factor>1e-6:          # 在局地化范围内加增量
+                xai[j]=xai[j]+cov_factor*state_inc;     # 公式（6-3-9）
+    return xai
+#%% 5-5 Lorenz96模式使用含有局地化的EnKF的同化实验
+sig_b= 1
+x0b = x0True + np.random.normal(0,sig_b,[n,])         # 初值
+B = sig_b**2*np.eye(n)                              # 初始误差协方差
+sig_p= 0.1
+Q = sig_p**2*np.eye(n)                              # 模式误差
+
+xb = np.zeros([n,nt+1]); xb[:,0] = x0b
+for k in range(nt):
+    xb[:,k+1] = RK4(Lorenz96,xb[:,k],dt,F)          # 控制实验
+
+N = 30                                       # 集合成员数
+xai = np.zeros([n,N])
+for i in range(N):
+    xai[:,i] = x0b + np.random.multivariate_normal(np.zeros(n), B)  # 初始集合 
+
+np.random.seed(seed=1) 
+localP = 4; rhom = Rho(localP ,n)            # !!!产生局地化矩阵，参数可调整
+
+xa = np.zeros([n,nt+1]); xa[:,0] = x0b
+km = 0
+for k in range(nt):
+    for i in range(N):              # 集合预报
+        xai[:,i] = RK4(Lorenz96,xai[:,i],dt,F) \
+                 + np.random.multivariate_normal(np.zeros(n), Q)
+    xa[:,k+1] = np.mean(xai,1)
+    if (km<nt_m) and (k+1==ind_m[km]):  # 开始同化
+        # xai = EnKF(xai,yo[:,km],h,Dh,R,rhom)
+        xai = sEAKF(xai,yo[:,km],h,R,rhom)
+        xa[:,k+1] = np.mean(xai,1)    
+        km = km+1
+RMSEb = np.sqrt(np.mean((xb-xTrue)**2,0))
+RMSEa = np.sqrt(np.mean((xa-xTrue)**2,0))
+mRMSEb = np.mean(RMSEb)
+mRMSEa = np.mean(RMSEa)
+#%% 画图相关代码
+import matplotlib.pyplot as plt
+plt.rcParams['font.sans-serif'] = ['Songti SC']
+plt.figure(figsize=(10,7))
+plt.subplot(4,1,1)
+plt.plot(t,xTrue[8,:], label='真值', linewidth = 3, color='C0')
+plt.plot(t,xb[8,:], ':', label='背景', linewidth = 3, color='C1')
+plt.plot(t,xa[8,:], '--', label='分析', linewidth = 3, color='C3')
+plt.ylabel(r'$X_{9}(t)$',labelpad=7,fontsize=16)
+plt.xticks(range(0,20,5),[],fontsize=16);plt.yticks(fontsize=16)
+plt.title("Lorenz96模式的串行EAKF同化",fontsize=16)
+plt.legend(loc=9,ncol=4,fontsize=15)
+
+plt.subplot(4,1,2)
+plt.plot(t,xTrue[17,:], label='真值', linewidth = 3, color='C0')
+plt.plot(t,xb[17,:], ':', label='背景', linewidth = 3, color='C1')
+plt.plot(t,xa[17,:], '--', label='分析', linewidth = 3, color='C3')
+plt.ylabel(r'$X_{18}(t)$', labelpad=7,fontsize=16)
+plt.xticks(range(0,20,5),[],fontsize=16);plt.yticks(fontsize=16)
+plt.legend(loc=9,ncol=4,fontsize=15)
+
+plt.subplot(4,1,3)
+plt.plot(t,xTrue[35,:], label='真值', linewidth = 3, color='C0')
+plt.plot(t,xb[35,:], ':', label='背景', linewidth = 3, color='C1')
+plt.plot(t[ind_m],yo[8,:], 'o', fillstyle='none', \
+                label='观测', markersize = 8, markeredgewidth = 2, color='C2')
+plt.plot(t,xa[35,:], '--', label='分析', linewidth = 3, color='C3')
+plt.ylim(-8,18)
+plt.ylabel(r'$X_{36}(t)$', labelpad=7,fontsize=16)
+plt.xticks(range(0,20,5),[],fontsize=16);plt.yticks(fontsize=16)
+plt.legend(loc=9,ncol=4,fontsize=15)
+
+plt.subplot(4,1,4)
+plt.plot(t,RMSEb,color='C1',label='背景均方根误差')
+plt.plot(t,RMSEa,color='C3',label='分析均方根误差')
+plt.text(2,1.5,'集合尺寸 = %.1f'%N + ', 局地化参数 = %0.1f'%localP,fontsize=13)
+plt.text(2,3.5,'背景误差平均值 = %.3f'%mRMSEb +', 分析误差平均值 = %.3f'%mRMSEa,fontsize=13)
+plt.ylim(0,10)
+plt.ylabel('均方根误差',labelpad=7,fontsize=16);
+plt.xlabel('时间（TU）',fontsize=16)
+plt.legend(loc=9,ncol=2,fontsize=15)
+plt.xticks(range(0,20,5),fontsize=16);plt.yticks(fontsize=16)
+plt.show()
